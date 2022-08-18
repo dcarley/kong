@@ -93,11 +93,70 @@ local function log(premature, conf, message)
   logger:close_socket()
 end
 
+-- TODO: copy/paste from acme plugin.
+-- This seems inefficient but we don't have a copy of the config when the timer
+-- is started from `init_worker`. Starting the timer with a semaphore from
+-- another phase also seems inefficient.
+local function find_config()
+  for plugin, err in kong.db.plugins:each(1000) do
+    if err then
+      kong.log.warn("error fetching plugin: ", err)
+    end
+
+    if plugin.name == "datadog" then
+      return plugin.config
+    end
+  end
+
+  return nil
+end
+
+local function submit_host_metrics(premature)
+  -- TODO: copy/paste from acme plugin
+  -- I don't know why `premature` would be passed and where from.
+  if premature then
+    kong.log.err("premature")
+    return
+  end
+
+  local conf = find_config()
+  if not conf then
+    kong.log.err("unable to find plugin config")
+    return
+  end
+
+  local logger, err = statsd_logger:new(conf)
+  if err then
+    kong.log.err("failed to create Statsd logger: ", err)
+    return
+  end
+
+  -- TODO: Should lua-resty-timer-ng stats also be reported? Or only native
+  -- timers because that's where exhaustion really matters?
+  local timers = {
+    ["timers.pending"] = ngx.timer.pending_count(),
+    ["timers.running"] = ngx.timer.running_count(),
+  }
+  local sample_rate = 1
+  local tags = {}
+  for name, value in pairs(timers) do
+    logger:send_statsd(name, value, "gauge", sample_rate, tags)
+  end
+
+  logger:close_socket()
+end
+
 
 local DatadogHandler = {
   PRIORITY = 10,
   VERSION = kong_meta.version,
 }
+
+
+function DatadogHandler:init_worker()
+  -- TODO: 10s is the default flush interval in statsd and datadog-agent
+  ngx.timer.every(10, submit_host_metrics)
+end
 
 
 function DatadogHandler:log(conf)
